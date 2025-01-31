@@ -545,6 +545,17 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 	// End of executable segment (may change)
 	u32 end = sec_end ? sec_end : segs[0].addr + segs[0].size;
 
+	// End of all segments
+	u32 segs_end = end;
+
+	for (const auto& s : segs)
+	{
+		if (s.size && s.addr != start)
+		{
+			segs_end = std::max(segs_end, s.addr + s.size);
+		}
+	}
+
 	// Known TOCs (usually only 1)
 	std::unordered_set<u32> TOCs;
 
@@ -567,11 +578,12 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 
 	// Known references (within segs, addr and value alignment = 4)
 	// For seg0, must be valid code
-	std::set<u32> addr_heap;
+	// Value is a sample of an address that refernces it
+	std::map<u32, u32> addr_heap;
 
 	if (entry)
 	{
-		addr_heap.emplace(entry);
+		addr_heap.emplace(entry, 0);
 	}
 
 	auto verify_ref = [&](u32 addr)
@@ -628,7 +640,7 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 		{
 			const ppu_opcode_t op{+range[index]};
 
-			switch (g_ppu_itype.decode(op.opcode))
+			switch (s_ppu_itype.decode(op.opcode))
 			{
 			case ppu_itype::UNK:
 			{
@@ -786,7 +798,7 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 						continue;
 					}
 
-					addr_heap.emplace(value);
+					addr_heap.emplace(value, _ptr.addr());
 					break;
 				}
 			}
@@ -1461,10 +1473,20 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 			const u32 func_end2 = _next == fmap.end() ? func_end : std::min<u32>(_next->first, func_end);
 
 			// Set more block entries
-			std::for_each(addr_heap.lower_bound(func.addr), addr_heap.lower_bound(func_end2), add_block);
+			std::for_each(addr_heap.lower_bound(func.addr), addr_heap.lower_bound(func_end2), [&](auto a) { add_block(a.first); });
 		}
 
 		const bool was_empty = block_queue.empty();
+
+		struct reg_state_t
+		{
+			bool is_const = false; // Is constant value(?)
+			bool is_loaded = false; // Is loaded from memory(?) (this includes offsetting from that address)
+			u32 tag = 0; // unused
+			u64 value = 0;
+		};
+
+		static constexpr reg_state_t s_reg_const_0{ true, 0, 0 };
 
 		// Block loop (block_queue may grow, may be aborted via clearing)
 		for (usz j = 0; j < block_queue.size(); j++)
@@ -1474,18 +1496,49 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 			vm::cptr<u32> _ptr = vm::cast(block.first);
 			auto ptr = ensure(get_ptr<u32>(_ptr));
 
+			// Uninitialized storage
+			alignas(reg_state_t) std::byte reg_state_storage[64 * sizeof(reg_state_t)];
+			u64 reg_mapped_mask = 0;
+
+			auto is_reg_mapped = [&](u32 index)
+			{
+				return !!(reg_mapped_mask & (1ull << index));
+			};
+
+			const auto get_reg = [&](usz index) -> reg_state_t&
+			{
+				if (!(reg_mapped_mask & (1ull << index)))
+				{
+					reg_mapped_mask |= 1ull << index;
+					return *(new (std::next(reg_state_storage, index * sizeof(reg_state_t))) reg_state_t{});
+				}
+
+				return *std::launder(reinterpret_cast<reg_state_t*>(reg_state_storage + (index * sizeof(reg_state_t))));
+			};
+
+			enum : u64
+			{
+				c_reg_lr = 32,
+				c_reg_ctr = 33,
+				c_reg_vrsave = 34,
+				c_reg_xer = 35,
+			};
+
 			for (; _ptr.addr() < func_end;)
 			{
 				const u32 iaddr = _ptr.addr();
 				const ppu_opcode_t op{*advance(_ptr, ptr, 1)};
 				const ppu_itype::type type = s_ppu_itype.decode(op.opcode);
 
-				if (type == ppu_itype::UNK)
+				switch (type)
+				{
+				case ppu_itype::UNK:
 				{
 					// Invalid blocks will remain empty
 					break;
 				}
-				else if (type == ppu_itype::B || type == ppu_itype::BC)
+				case ppu_itype::B:
+				case ppu_itype::BC:
 				{
 					const u32 target = (op.aa ? 0 : iaddr) + (type == ppu_itype::B ? +op.bt24 : +op.bt14);
 
@@ -1534,7 +1587,7 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 					block.second = _ptr.addr() - block.first;
 					break;
 				}
-				else if (type == ppu_itype::BCLR)
+				case ppu_itype::BCLR:
 				{
 					if (op.lk || (op.bo & 0x14) != 0x14)
 					{
@@ -1544,37 +1597,114 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 					block.second = _ptr.addr() - block.first;
 					break;
 				}
-				else if (type == ppu_itype::BCCTR)
+				case ppu_itype::BCCTR:
 				{
 					if (op.lk || (op.bo & 0x10) != 0x10)
 					{
 						add_block(_ptr.addr());
 					}
+					else if (get_reg(c_reg_ctr).is_const)
+					{
+						ppu_log.todo("[0x%x] BCTR to constant destination: 0x%x", func.addr, get_reg(c_reg_ctr).value);
+					}
 					else
 					{
 						// Analyse jumptable (TODO)
-						const u32 jt_addr = _ptr.addr();
-						const u32 jt_end = func_end;
+						u32 jt_addr = _ptr.addr();
+						u32 jt_end = func_end;
+						const auto code_end = get_ptr<u32>(func_end);
 
-						for (; _ptr.addr() < jt_end; advance(_ptr, ptr, 1))
+						auto get_jumptable_end = [&](vm::cptr<u32>& _ptr, be_t<u32>*& ptr, bool is_relative)
 						{
-							const u32 addr = jt_addr + *ptr;
-
-							if (addr == jt_addr)
+							for (; _ptr.addr() < jt_end; advance(_ptr, ptr, 1))
 							{
-								// TODO (cannot branch to jumptable itself)
-								break;
-							}
+								const u32 addr = (is_relative ? jt_addr : 0) + *ptr;
 
-							if (addr % 4 || addr < func.addr || addr >= jt_end)
+								if (addr == jt_addr)
+								{
+									// TODO (cannot branch to jumptable itself)
+									return;
+								}
+
+								if (addr % 4 || addr < func.addr || addr >= func_end || !is_valid_code({ get_ptr<u32>(addr), code_end }, entry != 0, addr))
+								{
+									return;
+								}
+
+								add_block(addr);
+							}
+						};
+
+						get_jumptable_end(_ptr, ptr, true);
+
+						bool found_jt = jt_addr == jt_end || _ptr.addr() != jt_addr;
+
+						if (!found_jt)
+							std::this_thread::yield();
+						if (!found_jt && is_reg_mapped(c_reg_ctr))
+						{
+							// Fallback: try to extract jumptable address from registers
+							const reg_state_t ctr = get_reg(c_reg_ctr);
+
+							if (ctr.is_loaded)
 							{
-								break;
-							}
+								vm::cptr<u32> jumpatble_off = vm::cast(static_cast<u32>(ctr.value));
 
-							add_block(addr);
+								if (be_t<u32>* jumpatble_ptr_begin = get_ptr<u32>(jumpatble_off))
+								{
+									be_t<u32>* jumpatble_ptr = jumpatble_ptr_begin;
+
+									jt_addr = jumpatble_off.addr();
+
+									for (const auto& seg : segs)
+									{
+										if (seg.size)
+										{
+											if (jt_addr < seg.addr + seg.size && jt_addr >= seg.addr)
+											{
+												jt_end = seg.addr + seg.size;
+												break;
+											}
+										}
+									}
+
+									// TODO: Get register value bounds
+									//get_jumptable_end(jumpatble_off, jumpatble_ptr, false);
+
+									// Until we have bounds, manually extract reference address
+									if (addr_heap.contains(_ptr.addr()))
+									{
+										// See who is referencing it
+										const u32 ref_addr = addr_heap.at(_ptr.addr());
+
+										if (ref_addr >= jt_addr && ref_addr < jt_end)
+										{
+											jumpatble_off = vm::cast(ref_addr);
+											jumpatble_ptr_begin = get_ptr<u32>(jumpatble_off);
+											jumpatble_ptr = jumpatble_ptr_begin;
+											jt_addr = ref_addr;
+
+											get_jumptable_end(jumpatble_off, jumpatble_ptr, false);
+										}
+									}
+
+									if (jumpatble_ptr != jumpatble_ptr_begin)
+									{
+										found_jt = true;
+
+										for (be_t<u32> addr : std::span<const be_t<u32>>{ jumpatble_ptr_begin , jumpatble_ptr })
+										{
+											if (addr == _ptr.addr())
+											{
+												ppu_log.success("[0x%x] Found address of next code in jump table! 0x%x-0x%x", func.addr, jt_addr, jt_addr + 4 * (jumpatble_ptr - jumpatble_ptr_begin));
+											}
+										}
+									}
+								}
+							}
 						}
 
-						if (jt_addr != jt_end && _ptr.addr() == jt_addr)
+						if (!found_jt)
 						{
 							// Acknowledge jumptable detection failure
 							if (!(func.attr & ppu_attr::no_size))
@@ -1595,8 +1725,17 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 					block.second = _ptr.addr() - block.first;
 					break;
 				}
-				else if (type & ppu_itype::trap && op.bo)
+				case ppu_itype::TD:
+				case ppu_itype::TW:
+				case ppu_itype::TDI:
+				case ppu_itype::TWI:
 				{
+					if (!op.bo)
+					{
+						// No-op
+						continue;
+					}
+
 					if (can_trap_continue(op, type))
 					{
 						add_block(_ptr.addr());
@@ -1605,20 +1744,184 @@ bool ppu_module<lv2_obj>::analyse(u32 lib_toc, u32 entry, const u32 sec_end, con
 					block.second = _ptr.addr() - block.first;
 					break;
 				}
-				else if (type == ppu_itype::SC)
+				case ppu_itype::SC:
 				{
 					add_block(_ptr.addr());
 					block.second = _ptr.addr() - block.first;
 					break;
 				}
-				else if (type == ppu_itype::STDU && func.attr & ppu_attr::no_size && (op.opcode == *ptr || *ptr == ppu_instructions::BLR()))
+				case ppu_itype::STDU:
 				{
-					// Hack
-					ppu_log.success("[0x%x] Instruction repetition: 0x%08x", iaddr, op.opcode);
-					add_block(_ptr.addr());
-					block.second = _ptr.addr() - block.first;
-					break;
+					if (func.attr & ppu_attr::no_size && (op.opcode == *ptr || *ptr == ppu_instructions::BLR()))
+					{
+						// Hack
+						ppu_log.success("[0x%x] Instruction repetition: 0x%08x", iaddr, op.opcode);
+						add_block(_ptr.addr());
+						block.second = _ptr.addr() - block.first;
+					}
+
+					continue;
 				}
+				case ppu_itype::ADDI:
+				case ppu_itype::ADDIC:
+				case ppu_itype::ADDIS:
+				{
+					const s64 to_add = type == ppu_itype::ADDIS ? op.simm16 * 65536 : op.simm16;
+
+					if (type == ppu_itype::ADDIS ? (to_add >= utils::align<u32>(segs_end, 65536) || (to_add / 65536) < (start / 65536)) : (to_add % 4))
+					{
+						// Don't bother
+						if (is_reg_mapped(op.rd))
+						{
+							get_reg(op.rd) = {};
+						}
+					}
+					else
+					{
+						const reg_state_t ra = type == ppu_itype::ADDIC || op.ra ? get_reg(op.ra) : s_reg_const_0;
+
+						if (ra.is_const)
+						{
+							reg_state_t& rd = get_reg(op.rd);
+							rd = {};
+							rd.is_const = true;
+							rd.value = ra.value + to_add;
+						}
+						else
+						{
+							if (is_reg_mapped(op.rd))
+							{
+								get_reg(op.rd) = {};
+							}
+						}
+					}
+
+					continue;
+				}
+				case ppu_itype::ORI:
+				case ppu_itype::ORIS:
+				{
+					const u64 to_or = type == ppu_itype::ORIS ? op.uimm16 * 65536 : op.uimm16;
+
+					if (type == ppu_itype::ORIS ? (to_or >= segs_end || (to_or / 65536) < (start / 65536)) : (to_or % 4))
+					{
+						// Don't bother
+						if (is_reg_mapped(op.ra))
+						{
+							get_reg(op.ra) = {};
+						}
+					}
+					else
+					{
+						const reg_state_t rs = get_reg(op.rs);
+
+						if (rs.is_const)
+						{
+							reg_state_t& ra = get_reg(op.ra);
+							ra = {};
+							ra.is_const = true;
+							ra.value = rs.value | to_or;
+						}
+						else
+						{
+							if (is_reg_mapped(op.ra))
+							{
+								get_reg(op.ra) = {};
+							}
+						}
+					}
+
+					continue;
+				}
+				case ppu_itype::MTSPR:
+				{
+					switch (const u32 n = (op.spr >> 5) | ((op.spr & 0x1f) << 5))
+					{
+					case 0x001: // MTXER
+					{
+						break;
+					}
+					case 0x008: // MTLR
+					{
+						//get_reg(c_reg_lr) = get_reg(op.rs);
+						break;
+					}
+					case 0x009: // MTCTR
+					{
+						get_reg(c_reg_ctr) = get_reg(op.rs);
+						break;
+					}
+					case 0x100:
+					{
+						// get_reg(c_reg_vrsave) = get_reg(op.rs);
+						// get_reg(c_reg_vrsave).value &= u32{umax};
+						break;
+					}
+					default:
+					{
+						break;
+					}
+					}
+
+					continue;
+				}
+				case ppu_itype::LWZX:
+				case ppu_itype::LDX: // TODO: Confirm if LDX can appear in jumptable branching (probably in LV1 applications such as ps2_emu)
+				{
+					if (is_reg_mapped(op.ra) || is_reg_mapped(op.rb))
+					{
+						if (_ptr.addr() == 0x4cf248)
+							std::this_thread::yield();
+
+						const reg_state_t ra = get_reg(op.ra);
+						const reg_state_t rb = get_reg(op.rb);
+
+						const bool is_ra = ra.is_const && (ra.value >= start && ra.value < segs_end);
+						const bool is_rb = rb.is_const && (rb.value >= start && rb.value < segs_end);
+
+						if (ra.is_const == rb.is_const)
+						{
+							if (is_reg_mapped(op.rd))
+							{
+								get_reg(op.rd) = {};
+							}
+						}
+						else
+						{
+							// Register possible jumptable offset
+							auto& rd = get_reg(op.rd);
+							rd = {};
+							rd.is_loaded = true;
+							rd.value = is_ra ? ra.value : rb.value;
+						}
+					}
+
+					continue;
+				}
+				default:
+				{
+					if (type & ppu_itype::store)
+					{
+						continue;
+					}
+
+					// TODO: Tell if instruction modified RD or RA
+
+					if (is_reg_mapped(op.rd))
+					{
+						get_reg(op.rd) = {};
+					}
+
+					if (is_reg_mapped(op.ra))
+					{
+						get_reg(op.ra) = {};
+					}
+
+					continue;
+				}
+				}
+
+				break;
 			}
 		}
 
